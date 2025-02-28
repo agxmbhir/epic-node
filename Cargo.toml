@@ -5,16 +5,30 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["server"]
+server = ["tokio"]
 
 [dependencies]
 bincode = "1.3.3"
-tfhe = { version = "0.10", features = ["boolean", "shortint", "integer"] }
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.28", features = ["full"] }
+tokio = { version = "1.28", features = ["full"], optional = true }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1.0"
 thiserror = "2.0.11"
-rand = "0.9"
+# Removed rand dependency since our implementation doesn't use randomness
 dotenv = "0.15"
 clap = { version = "4.3", features = ["derive"] }
+num-traits = "0.2"
+sp1-sdk = { version = "4.0.0", optional = true }
+fibonacci-lib = { path = "../fibonacci/lib" }
+
+[[bin]]
+name = "attestation_script"
+path = "src/attestation_script.rs"
+required-features = ["sp1-sdk"]
+
+[lib]
+name = "epic_node"
+path = "src/lib.rs"

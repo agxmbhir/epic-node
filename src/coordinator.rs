@@ -1,245 +1,158 @@
-use anyhow::{ anyhow, Result };
+#[cfg(feature = "server")]
+use anyhow::Result;
+#[cfg(feature = "server")]
 use std::fs;
-use tfhe::{
-    generate_keys,
-    prelude::*,
-    safe_serialization::{ safe_deserialize, safe_deserialize_conformant, safe_serialize },
-    set_server_key,
-    ClientKey,
-    ConfigBuilder,
-    PublicKey,
-    ServerKey,
-};
+#[cfg(feature = "server")]
 use tracing::info;
-
+#[cfg(feature = "server")]
+use serde::{ Serialize, Deserialize };
+#[cfg(feature = "server")]
+use bincode;
+#[cfg(feature = "server")]
 use crate::types::AttestorError;
+use crate::homomorphic::{SimpleHomomorphic, PublicKey, PrivateKey};
 
-/// Key coordinator for TFHE operations
+/// Key coordinator for homomorphic operations
+#[cfg(feature = "server")]
 pub struct AttestationCoordinator {
-    /// Client key (PRIVATE - should not be shared)
-    pub client_key: ClientKey,
-    /// Server key for homomorphic operations (can be shared)
-    pub server_key: ServerKey,
-    /// Config used to generate keys
-    config: tfhe::Config,
+    /// Encryption key (can be shared safely)
+    pub encryption_key: PublicKey,
+    /// Decryption key (PRIVATE - must stay secure)
+    pub decryption_key: PrivateKey,
 }
 
+#[cfg(feature = "server")]
 impl AttestationCoordinator {
     /// Create a new coordinator with newly generated keys
     pub fn new() -> Result<Self> {
-        // Configure TFHE parameters using default settings
-        let config = ConfigBuilder::default().build();
-
-        let (client_key, server_key) = generate_keys(config.clone());
+        // Generate a fresh keypair with default settings
+        let seed = b"epic-node-deterministic-seed";
+        let (encryption_key, decryption_key) = SimpleHomomorphic::generate_key_pair(1024, seed);
 
         Ok(Self {
-            client_key,
-            server_key,
-            config,
+            encryption_key,
+            decryption_key,
         })
     }
 
     /// Load from existing key files
-    pub fn from_key_files(client_key_path: &str, server_key_path: &str) -> Result<Self> {
-        // Create config with default parameters
-        let config = ConfigBuilder::default().build();
+    pub fn from_key_files(encryption_key_path: &str, decryption_key_path: &str) -> Result<Self> {
+        // Read and deserialize the encryption key
+        let encryption_key_data = fs
+            ::read(encryption_key_path)
+            .map_err(|e|
+                AttestorError::KeyLoadError(format!("Failed to read encryption key: {}", e))
+            )?;
 
-        // Maximum allowed size for deserialization (1GB)
-        let max_size = 1 << 30;
+        let encryption_key = PublicKey::from_bytes(&encryption_key_data)
+            .map_err(|e|
+                AttestorError::KeyLoadError(format!("Failed to deserialize encryption key: {}", e))
+            )?;
 
-        // Read and deserialize the client key (PRIVATE)
-        let client_key_data = fs
-            ::read(client_key_path)
-            .map_err(|e| AttestorError::KeyLoadError(format!("Failed to read client key: {}", e)))?;
+        // Read and deserialize the decryption key (PRIVATE)
+        let decryption_key_data = fs
+            ::read(decryption_key_path)
+            .map_err(|e|
+                AttestorError::KeyLoadError(format!("Failed to read decryption key: {}", e))
+            )?;
 
-        let client_key: ClientKey = safe_deserialize(&*client_key_data, max_size).map_err(|e|
-            AttestorError::KeyLoadError(format!("Failed to deserialize client key: {}", e))
-        )?;
-
-        // Read and deserialize the server key
-        let server_key_data = fs
-            ::read(server_key_path)
-            .map_err(|e| AttestorError::KeyLoadError(format!("Failed to read server key: {}", e)))?;
-
-        let server_key: ServerKey = safe_deserialize_conformant(
-            &*server_key_data,
-            max_size,
-            &config.into()
-        ).map_err(|e|
-            AttestorError::KeyLoadError(format!("Failed to deserialize server key: {}", e))
-        )?;
+        let decryption_key = PrivateKey::from_bytes(&decryption_key_data)
+            .map_err(|e|
+                AttestorError::KeyLoadError(format!("Failed to deserialize decryption key: {}", e))
+            )?;
 
         Ok(Self {
-            client_key,
-            server_key,
-            config,
+            encryption_key,
+            decryption_key,
         })
     }
 
-    /// Save the client key to a file (PRIVATE - should be kept secure)
-    pub fn save_client_key(&self, path: &str) -> Result<()> {
-        // Maximum allowed size for serialization (1GB)
-        let max_size = 1 << 30;
-
-        // Create a buffer to hold the serialized data
-        let mut buffer = Vec::new();
-
-        // Serialize the client key
-        safe_serialize(&self.client_key, &mut buffer, max_size).map_err(|e|
-            AttestorError::KeySaveError(format!("Failed to serialize client key: {}", e))
-        )?;
+    /// Save the decryption key to a file (PRIVATE - should be kept secure)
+    pub fn save_decryption_key(&self, path: &str) -> Result<()> {
+        // Serialize the decryption key
+        let serialized_key = self.decryption_key.to_bytes();
 
         // Write the buffer to file
         fs
-            ::write(path, buffer)
+            ::write(path, serialized_key)
             .map_err(|e|
-                AttestorError::KeySaveError(format!("Failed to write client key to file: {}", e))
+                AttestorError::KeySaveError(
+                    format!("Failed to write decryption key to file: {}", e)
+                )
             )?;
 
-        info!("Saved client key to: {}", path);
+        info!("Saved decryption key to: {}", path);
         info!("WARNING: Keep this file secure. It contains your private key.");
         Ok(())
     }
 
-    /// Generate and save all keys (client, server, and public)
+    /// Generate and save all keys (encryption and decryption)
     pub fn generate_and_save_all_keys(
-        client_key_path: &str,
-        server_key_path: &str,
-        public_key_path: &str
+        encryption_key_path: &str,
+        decryption_key_path: &str
     ) -> Result<Self> {
-        // Configure TFHE parameters with default settings
-        let config = ConfigBuilder::default().build();
-        let (client_key, server_key) = generate_keys(config.clone());
+        // Generate a fresh keypair
+        let seed = b"epic-node-deterministic-seed";
+        let (encryption_key, decryption_key) = SimpleHomomorphic::generate_key_pair(1024, seed);
 
-        // Maximum allowed size for serialization (1GB)
-        let max_size = 1 << 40;
-
-        // Save the client key (PRIVATE)
-        let mut client_buffer = Vec::new();
-        safe_serialize(&client_key, &mut client_buffer, max_size).map_err(|e|
-            AttestorError::KeySaveError(format!("Failed to serialize client key: {}", e))
-        )?;
+        // Save the encryption key
+        let serialized_encryption_key = encryption_key.to_bytes();
 
         fs
-            ::write(client_key_path, client_buffer)
+            ::write(encryption_key_path, serialized_encryption_key)
             .map_err(|e|
-                AttestorError::KeySaveError(format!("Failed to write client key to file: {}", e))
+                AttestorError::KeySaveError(
+                    format!("Failed to write encryption key to file: {}", e)
+                )
             )?;
 
-        // Save the server key
-        let mut server_buffer = Vec::new();
-        safe_serialize(&server_key, &mut server_buffer, max_size).map_err(|e|
-            AttestorError::KeySaveError(format!("Failed to serialize server key: {}", e))
-        )?;
+        // Save the decryption key (PRIVATE)
+        let serialized_decryption_key = decryption_key.to_bytes();
 
         fs
-            ::write(server_key_path, server_buffer)
+            ::write(decryption_key_path, serialized_decryption_key)
             .map_err(|e|
-                AttestorError::KeySaveError(format!("Failed to write server key to file: {}", e))
-            )?;
-
-        // Generate the public key from the client key
-        let public_key = PublicKey::new(&client_key);
-
-        // Save the public key
-        let mut public_buffer = Vec::new();
-        safe_serialize(&public_key, &mut public_buffer, max_size).map_err(|e|
-            AttestorError::KeySaveError(format!("Failed to serialize public key: {}", e))
-        )?;
-
-        fs
-            ::write(public_key_path, public_buffer)
-            .map_err(|e|
-                AttestorError::KeySaveError(format!("Failed to write public key to file: {}", e))
+                AttestorError::KeySaveError(
+                    format!("Failed to write decryption key to file: {}", e)
+                )
             )?;
 
         info!("Generated and saved all keys");
-        info!("Client key (PRIVATE): {}", client_key_path);
-        info!("Server key: {}", server_key_path);
-        info!("Public key: {}", public_key_path);
+        info!("Encryption key: {}", encryption_key_path);
+        info!("Decryption key (PRIVATE): {}", decryption_key_path);
 
         // Return the coordinator with the generated keys
         Ok(Self {
-            client_key,
-            server_key,
-            config,
+            encryption_key,
+            decryption_key,
         })
     }
 
-    /// Save public key to a file
-    pub fn save_public_key(&self, path: &str) -> Result<()> {
-        // Generate public key from client key
-        let public_key = PublicKey::new(&self.client_key);
-
-        // Maximum allowed size for serialization (1GB)
-        let max_size = 1 << 40;
-
-        // Create a buffer to hold the serialized data
-        let mut buffer = Vec::new();
-
-        // Serialize the public key
-        safe_serialize(&public_key, &mut buffer, max_size).map_err(|e|
-            AttestorError::KeySaveError(format!("Failed to serialize public key: {}", e))
-        )?;
+    /// Save encryption key to a file
+    pub fn save_encryption_key(&self, path: &str) -> Result<()> {
+        // Serialize the encryption key
+        let serialized_key = self.encryption_key.to_bytes();
 
         // Write the buffer to file
         fs
-            ::write(path, buffer)
+            ::write(path, serialized_key)
             .map_err(|e|
-                AttestorError::KeySaveError(format!("Failed to write public key to file: {}", e))
+                AttestorError::KeySaveError(
+                    format!("Failed to write encryption key to file: {}", e)
+                )
             )?;
 
-        info!("Saved public key to {}", path);
+        info!("Saved encryption key to {}", path);
         Ok(())
     }
 
-    /// Save the server key to a file
-    pub fn save_server_key(&self, path: &str) -> Result<()> {
-        // Maximum allowed size for serialization (1GB)
-        let max_size = 1 << 30;
-
-        // Create a buffer to hold the serialized data
-        let mut buffer = Vec::new();
-
-        // Serialize the server key
-        safe_serialize(&self.server_key, &mut buffer, max_size).map_err(|e|
-            AttestorError::KeySaveError(format!("Failed to serialize server key: {}", e))
-        )?;
-
-        // Write the buffer to file
-        fs
-            ::write(path, buffer)
-            .map_err(|e|
-                AttestorError::KeySaveError(format!("Failed to write server key to file: {}", e))
-            )?;
-
-        info!("Saved server key to: {}", path);
-        Ok(())
+    /// Get the encryption key (can be shared)
+    pub fn get_encryption_key(&self) -> &PublicKey {
+        &self.encryption_key
     }
 
-    /// Get the client key (PRIVATE)
-    pub fn get_client_key(&self) -> &ClientKey {
-        &self.client_key
-    }
-
-    /// Get the server key (PUBLIC)
-    pub fn get_server_key(&self) -> &ServerKey {
-        &self.server_key
-    }
-
-    /// Get the config
-    pub fn get_config(&self) -> &tfhe::Config {
-        &self.config
-    }
-
-    /// Get the public key (generated from client key)
-    pub fn get_public_key(&self) -> PublicKey {
-        PublicKey::new(&self.client_key)
-    }
-
-    /// Set the server key for operations
-    pub fn set_server_key_for_operations(&self) {
-        // Make the server key available for global use
-        set_server_key(self.server_key.clone());
+    /// Get the decryption key (PRIVATE)
+    pub fn get_decryption_key(&self) -> &PrivateKey {
+        &self.decryption_key
     }
 }

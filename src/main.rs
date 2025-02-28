@@ -1,188 +1,175 @@
-mod attestor;
-mod coordinator;
-mod types;
-
+#[cfg(feature = "server")]
+use anyhow::Result;
+#[cfg(feature = "server")]
+use epic_node::attestor::{AttestorNode, KeyGeneration};
+#[cfg(feature = "server")]
+use epic_node::homomorphic::{SimpleHomomorphic, PublicKey, PrivateKey, sp1_helpers};
+#[cfg(feature = "server")]
+use epic_node::types::{AttestationValue, Attestation};
+#[cfg(feature = "server")]
+use std::path::Path;
+#[cfg(feature = "server")]
 use std::fs;
 
-use anyhow::Result;
-use attestor::AttestorNode;
-use coordinator::AttestationCoordinator;
-use tfhe::{
-    prelude::{ FheDecrypt, FheOrd },
-    safe_serialization::safe_deserialize,
-    set_server_key,
-    ClientKey,
-};
-
-use types::{ AttestationValue, AttestorError };
-
+#[cfg(feature = "server")]
 fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
-
-    // Create directories if they don't exist
-    fs::create_dir_all("./keys")?;
-    fs::create_dir_all("./attestations")?;
-
-    println!("==== Part 1: Generating Keys ====");
-
-    // Generate and save keys
-    let coordinator = AttestationCoordinator::generate_and_save_all_keys(
-        "./keys/exchange_client.key",
-        "./keys/exchange_server.key",
-        "./keys/exchange_public.key"
-    )?;
-
-    println!("\n==== Part 2: Creating Attestation ====");
-
-    println!("\n==== 2: Creating Attestation  Nodes====");
-    // Create an attestor node from the coordinator's public key
-    let attestor0 = AttestorNode::new_from_file(0, "./keys/exchange_public.key")?;
-    let attestor1 = AttestorNode::new_from_file(1, "./keys/exchange_public.key")?;
-    let attestor2 = AttestorNode::new_from_file(2, "./keys/exchange_public.key")?;
-
-    // Create sample attestation values
-    let values = vec![
-        AttestationValue {
-            value_type: "reserves".to_string(),
-            value: 1_000_000, // 1 million units
-            timestamp: std::time::SystemTime
-                ::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-            metadata: r#"{"asset":"USDC","source":"exchange_hot_wallet"}"#.to_string(),
+    // Parse command-line arguments
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.len() < 2 {
+        println!("Usage: {} <command> [args...]", args[0]);
+        println!("Commands:");
+        println!("  generate-keys <key_size> <output_dir>");
+        println!("  create-attestation <node_id> <pubkey_path> <values_file> <output_path>");
+        println!("  decrypt <privkey_path> <attestation_path>");
+        return Ok(());
+    }
+    
+    match args[1].as_str() {
+        "generate-keys" => {
+            if args.len() < 4 {
+                println!("Usage: {} generate-keys <key_size> <output_dir>", args[0]);
+                return Ok(());
+            }
+            
+            let key_size = args[2].parse::<usize>().unwrap_or(1024);
+            let output_dir = &args[3];
+            
+            generate_keys(key_size, output_dir)?;
         },
-        AttestationValue {
-            value_type: "liabilities".to_string(),
-            value: 800_000, // 800,000 units
-            timestamp: std::time::SystemTime
-                ::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-            metadata: r#"{"asset":"USDC","source":"exchange_db"}"#.to_string(),
+        "create-attestation" => {
+            if args.len() < 6 {
+                println!("Usage: {} create-attestation <node_id> <pubkey_path> <values_file> <output_path>", args[0]);
+                return Ok(());
+            }
+            
+            let node_id = args[2].parse::<u64>().unwrap_or(0);
+            let pubkey_path = &args[3];
+            let values_file = &args[4];
+            let output_path = &args[5];
+            
+            create_attestation(node_id, pubkey_path, values_file, output_path)?;
+        },
+        "decrypt" => {
+            if args.len() < 4 {
+                println!("Usage: {} decrypt <privkey_path> <attestation_path>", args[0]);
+                return Ok(());
+            }
+            
+            let privkey_path = &args[2];
+            let attestation_path = &args[3];
+            
+            decrypt_attestation(privkey_path, attestation_path)?;
+        },
+        _ => {
+            println!("Unknown command: {}", args[1]);
+            println!("Usage: {} <command> [args...]", args[0]);
+            println!("Commands:");
+            println!("  generate-keys <key_size> <output_dir>");
+            println!("  create-attestation <node_id> <pubkey_path> <values_file> <output_path>");
+            println!("  decrypt <privkey_path> <attestation_path>");
         }
-    ];
-
-    // Create the attestation
-    let attestation0 = attestor0.create_attestation_from_values(&values)?;
-    let attestation1 = attestor1.create_attestation_from_values(&values)?;
-    let attestation2 = attestor2.create_attestation_from_values(&values)?;
-
-    // Save the attestation
-    attestor0.save_attestation(&attestation0, "./attestations/exchange_attestation0.bin")?;
-    attestor1.save_attestation(&attestation1, "./attestations/exchange_attestation1.bin")?;
-    attestor2.save_attestation(&attestation2, "./attestations/exchange_attestation2.bin")?;
-
-    println!("\n==== Part 3: Loading Keys and Attestation ====");
-    let loaded_attestation0 = attestor0.load_attestation(
-        "./attestations/exchange_attestation0.bin"
-    )?;
-    let loaded_attestation1 = attestor1.load_attestation(
-        "./attestations/exchange_attestation1.bin"
-    )?;
-    let loaded_attestation2 = attestor2.load_attestation(
-        "./attestations/exchange_attestation2.bin"
-    )?;
-
-    println!("\n==== Part 4: Performing Homomorphic Operations ====");
-    set_server_key(coordinator.server_key);
-
-    // Load the client key for decryption
-    let client_key_data = fs
-        ::read("./keys/exchange_client.key")
-        .map_err(|e|
-            AttestorError::KeyLoadError(format!("Failed to read public key file: {}", e))
-        )?;
-
-    // Maximum allowed size for deserialization (1GB)
-    let max_size = 1 << 40;
-
-    let client_key: ClientKey = safe_deserialize(&*client_key_data, max_size).map_err(|e|
-        AttestorError::KeyLoadError(format!("Failed to deserialize public key: {}", e))
-    )?;
-
-    // Make sure we have at least 2 values in each attestation (reserves and liabilities)
-    if
-        loaded_attestation0.values.len() >= 2 &&
-        loaded_attestation1.values.len() >= 2 &&
-        loaded_attestation2.values.len() >= 2
-    {
-        // Extract reserves and liabilities from each attestation
-        let reserves0 = &loaded_attestation0.values[0];
-        let liabilities0 = &loaded_attestation0.values[1];
-
-        let reserves1 = &loaded_attestation1.values[0];
-        let liabilities1 = &loaded_attestation1.values[1];
-
-        let reserves2 = &loaded_attestation2.values[0];
-        let liabilities2 = &loaded_attestation2.values[1];
-
-        println!("Performing homomorphic operations on encrypted values...");
-
-        // 1. Sum of all reserves across attestors
-        let total_reserves = reserves0.clone() + reserves1.clone() + reserves2.clone();
-        println!("Homomorphic sum of all reserves computed");
-
-        // 2. Sum of all liabilities across attestors
-        let total_liabilities = liabilities0.clone() + liabilities1.clone() + liabilities2.clone();
-        println!("Homomorphic sum of all liabilities computed");
-
-        // 3. Check if total reserves > total liabilities (solvency check)
-        let solvency_check = &total_reserves.gt(&total_liabilities);
-        println!("Homomorphic comparison (reserves > liabilities) computed");
-
-        // 4. Calculate surplus/deficit
-        let surplus_deficit = &total_reserves - &total_liabilities;
-        println!("Homomorphic calculation of surplus/deficit computed");
-
-        let decrypted_total_reserves: u64 = total_reserves.decrypt(&client_key);
-        let decrypted_total_liabilities: u64 = total_liabilities.decrypt(&client_key);
-        let decrypted_solvency_check: bool = solvency_check.decrypt(&client_key);
-        let decrypted_surplus_deficit: u64 = surplus_deficit.decrypt(&client_key);
-
-        println!("\nDecrypted Results:");
-        println!("Total Reserves: {}", decrypted_total_reserves);
-        println!("Total Liabilities: {}", decrypted_total_liabilities);
-        println!("Solvency Check (Reserves > Liabilities): {}", decrypted_solvency_check);
-        println!("Surplus/Deficit: {}", decrypted_surplus_deficit);
-        // Printout all the computed
-        // Now decrypt the results using the client key to demonstrate correctness
-        println!("\nDecrypted Results:");
-
-        // Additional example: Homomorphic multiplication
-    } else {
-        println!("Error: Attestations don't have enough values for homomorphic operations");
     }
+    
+    Ok(())
+}
 
-    println!("\n==== Part 4: Demonstrating Encryption Results ====");
+#[cfg(not(feature = "server"))]
+fn main() {
+    println!("Server feature is disabled. Please rebuild with the 'server' feature enabled.");
+}
 
-    // For demonstration only - decrypt to show the values were properly encrypted
-    // For demonstration only - decrypt to show the values were properly encrypted
-    if loaded_attestation0.values.len() >= 2 {
-        println!("Attestation 0 Decrypted Values:");
-        let reserves0: u32 = loaded_attestation0.values[0].decrypt(&client_key);
-        let liabilities0: u32 = loaded_attestation0.values[1].decrypt(&client_key);
-        println!("  Reserves: {}", reserves0);
-        println!("  Liabilities: {}", liabilities0);
+#[cfg(feature = "server")]
+// Generate public and private keys for homomorphic encryption
+fn generate_keys(key_size: usize, output_dir: &str) -> Result<()> {
+    println!("Generating {} bit keys...", key_size);
+    
+    // Create output directory if it doesn't exist
+    fs::create_dir_all(output_dir)?;
+    
+    // Generate a deterministic seed
+    let seed = b"epic-node-deterministic-seed";
+    
+    // Generate the key pair
+    let (public_key, private_key) = KeyGeneration::generate_key_pair(key_size, seed);
+    
+    // Save keys to files
+    let public_key_path = Path::new(output_dir).join("public.key");
+    let private_key_path = Path::new(output_dir).join("private.key");
+    
+    KeyGeneration::save_public_key(&public_key, public_key_path.to_str().unwrap())?;
+    KeyGeneration::save_private_key(&private_key, private_key_path.to_str().unwrap())?;
+    
+    println!("Keys generated and saved to:");
+    println!("  Public key: {}", public_key_path.display());
+    println!("  Private key: {}", private_key_path.display());
+    
+    Ok(())
+}
 
-        println!("\nAttestation 1 Decrypted Values:");
-        let reserves1: u32 = loaded_attestation1.values[0].decrypt(&client_key);
-        let liabilities1: u32 = loaded_attestation1.values[1].decrypt(&client_key);
-        println!("  Reserves: {}", reserves1);
-        println!("  Liabilities: {}", liabilities1);
-
-        println!("\nAttestation 2 Decrypted Values:");
-        let reserves2: u32 = loaded_attestation2.values[0].decrypt(&client_key);
-        let liabilities2: u32 = loaded_attestation2.values[1].decrypt(&client_key);
-        println!("  Reserves: {}", reserves2);
-        println!("  Liabilities: {}", liabilities2);
+#[cfg(feature = "server")]
+// Create an attestation from values in a file
+fn create_attestation(node_id: u64, pubkey_path: &str, values_file: &str, output_path: &str) -> Result<()> {
+    println!("Creating attestation for node {}...", node_id);
+    
+    // Load the public key
+    let public_key = KeyGeneration::load_public_key(pubkey_path)?;
+    
+    // Create an attestor node
+    let attestor = AttestorNode::new(node_id, public_key);
+    
+    // Read values from file
+    let values_str = fs::read_to_string(values_file)?;
+    let values: Vec<u64> = values_str
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+        .collect();
+    
+    if values.is_empty() {
+        println!("No valid values found in file: {}", values_file);
+        return Ok(());
     }
+    
+    println!("Read {} values from {}", values.len(), values_file);
+    
+    // Create attestation
+    let attestation = attestor.create_attestation(&values)?;
+    
+    // Save attestation to file
+    attestor.save_attestation(&attestation, output_path)?;
+    
+    println!("Attestation created and saved to: {}", output_path);
+    
+    Ok(())
+}
 
+#[cfg(feature = "server")]
+// Decrypt an attestation using a private key
+fn decrypt_attestation(privkey_path: &str, attestation_path: &str) -> Result<()> {
+    println!("Decrypting attestation...");
+    
+    // Load the private key
+    let private_key = KeyGeneration::load_private_key(privkey_path)?;
+    
     // Load the attestation
-
-    println!("\nAll operations completed successfully!");
-    println!("Keys are stored in the ./keys directory");
-    println!("Attestations are stored in the ./attestations directory");
-
+    let attestation_data = fs::read(attestation_path)?;
+    let attestation: Attestation = bincode::deserialize(&attestation_data)?;
+    
+    println!("Attestation loaded with {} values", attestation.values.len());
+    
+    // Decrypt each value
+    println!("Decrypted values:");
+    for (i, encrypted_value) in attestation.values.iter().enumerate() {
+        // Convert to our Ciphertext type
+        let ciphertext = epic_node::homomorphic::Ciphertext {
+            value: encrypted_value.value.clone(),
+        };
+        
+        // Decrypt the value
+        let decrypted = SimpleHomomorphic::decrypt(&private_key, &ciphertext);
+        
+        println!("  Value {}: {}", i, decrypted);
+    }
+    
     Ok(())
 }
